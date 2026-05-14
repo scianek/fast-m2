@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "fast-m2"
+version = "0.1.0"
+description = "Python package for M2 scoring of GEC systems, with a Rust core for speed"
+readme = "README.md"
+requires-python = ">=3.9"
+
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "fast_m2._core"
