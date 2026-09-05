@@ -5,6 +5,7 @@ build-backend = "maturin"
 [project]
 name = "fast-m2"
 version = "0.1.0"
+license = "GPL-3.0-or-later"
 description = "Python package for M2 scoring of GEC systems, with a Rust core for speed"
 readme = "README.md"
 requires-python = ">=3.9"
