@@ -1,23 +1,19 @@
-//! Rust core for fast-m2: M2 scorer for grammatical error correction evaluation.
+//! Fast Rust core for M2 scorer (Grammatical Error Correction evaluation).
 //!
-//! Implements the max-match scoring algorithm from Dahlmeier & Ng (2012). Given a
-//! system hypothesis and a set of gold annotations in M2 format, the scorer extracts
-//! edit sequences from both, aligns them via a weighted edit graph, and computes
-//! corpus-level precision, recall, and F_beta.
-//!
-//! The main entry point exposed to Python is [`batch_multi_pre_rec_f1`], which takes
-//! parallel lists of hypothesis sentences and gold annotation maps and returns the
-//! three metrics as a tuple. All other functions are internal pipeline stages.
+//! Replicates Dahlmeier & Ng (2012) MaxMatch evaluation with exact parity,
+//! while eliminating quadratic bottlenecks and redundant path relaxations.
 
 use pyo3::prelude::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// A single edit operation on a token span, extracted from a Levenshtein alignment.
-///
-/// `start` and `end` are token offsets into the source sentence (end is exclusive).
-/// `orig` is the source token(s) in that span, `corr` is the replacement string.
-/// `unchanged_words` counts how many tokens passed through unmodified; this is
-/// used by `transitive_arcs` to enforce the `max_unchanged_words` cap on merged spans.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum EditKind {
+    Ins,
+    Del,
+    Sub,
+    Noop,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Edit {
     kind: EditKind,
@@ -28,19 +24,6 @@ struct Edit {
     unchanged_words: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum EditKind {
-    Ins,
-    Del,
-    Sub,
-    Noop,
-}
-
-/// A single annotation from an M2 file, representing one acceptable correction.
-///
-/// `start` and `end` are token offsets (i64 to accommodate the -1 noop sentinel).
-/// `corrections` holds every acceptable correction string for this span; a system
-/// edit is considered correct if its `corr` appears anywhere in this list.
 #[derive(Clone, Debug)]
 struct GoldEdit {
     start: i64,
@@ -49,18 +32,9 @@ struct GoldEdit {
     corrections: Vec<String>,
 }
 
-/// A cell position (row, col) in the Levenshtein matrix, used as a graph vertex.
 type Vertex = (usize, usize);
-
-/// A directed edge between two vertices in the edit graph.
 type Edge = (Vertex, Vertex);
 
-/// A directed acyclic graph of edit operations derived from a Levenshtein matrix.
-///
-/// Each edge corresponds to one edit (ins/del/sub/noop) and carries a distance
-/// weight. Weights start at 1.0 and are adjusted by `set_weights` to reward
-/// edges that match gold edits (negative weight) and penalise spurious ones
-/// (small positive epsilon), so that Bellman-Ford finds the best-matching path.
 struct EditGraph {
     vertices: Vec<Vertex>,
     edges: Vec<Edge>,
@@ -68,15 +42,6 @@ struct EditGraph {
     edits: HashMap<Edge, Edit>,
 }
 
-/// Computes the Levenshtein distance matrix and a backpointer table between
-/// `first` (source tokens) and `second` (hypothesis tokens).
-///
-/// Returns the filled distance matrix and a map from every reachable vertex to
-/// its predecessor vertices, along with the edit that produced each transition.
-/// A vertex can have multiple backpointers when several operations tie on cost,
-/// which is why the graph can branch. `cost_ins`, `cost_del`, and `cost_sub`
-/// are configurable; the scorer calls this function twice with sub-cost 1 and 2
-/// to capture alternative alignments, then merges the resulting graphs.
 fn levenshtein_matrix(
     first: &[String],
     second: &[String],
@@ -111,7 +76,7 @@ fn levenshtein_matrix(
         let edit = Edit {
             kind: EditKind::Ins,
             start: 0,
-            end: 0, // zero-width span: insertion adds tokens without consuming source
+            end: 0,
             orig: String::new(),
             corr: second[j - 1].clone(),
             unchanged_words: 0,
@@ -132,8 +97,6 @@ fn levenshtein_matrix(
             let best = sub_val.min(del_val).min(ins_val);
             mat[i][j] = best;
 
-            // All operations that tie on cost are recorded as backpointers so the
-            // graph captures every optimal alignment, not just one.
             if sub_val == best {
                 let edit = Edit {
                     kind: if same { EditKind::Noop } else { EditKind::Sub },
@@ -166,7 +129,7 @@ fn levenshtein_matrix(
                 let edit = Edit {
                     kind: EditKind::Ins,
                     start: i,
-                    end: i, // zero-width span at source position i
+                    end: i,
                     orig: String::new(),
                     corr: second[j - 1].clone(),
                     unchanged_words: 0,
@@ -182,12 +145,6 @@ fn levenshtein_matrix(
     (mat, backpointers)
 }
 
-/// Constructs an `EditGraph` from a Levenshtein matrix and its backpointer table.
-///
-/// Performs a BFS from the bottom-right corner of the matrix (the vertex
-/// representing the complete source-hypothesis alignment) backwards through all
-/// predecessor vertices. Every transition becomes a directed edge in the graph,
-/// initialised with distance 1.0. The resulting graph is a DAG from (0,0) to (n,m).
 fn build_edit_graph(
     mat: &[Vec<u32>],
     backpointers: &HashMap<Vertex, Vec<(Vertex, Edit)>>,
@@ -199,7 +156,7 @@ fn build_edit_graph(
 
     let v_start: Vertex = (mat.len() - 1, mat[0].len() - 1);
     let mut queue: Vec<Vertex> = vec![v_start];
-    let mut visited: std::collections::HashSet<Vertex> = std::collections::HashSet::new();
+    let mut visited: HashSet<Vertex> = HashSet::new();
 
     while !queue.is_empty() {
         let v = queue.remove(0);
@@ -230,29 +187,24 @@ fn build_edit_graph(
     }
 }
 
-/// Merges two `EditGraph`s into one by taking the union of their vertices, edges,
-/// distances, and edit maps.
-///
-/// When the same edge appears in both graphs, the entry from `g1` is kept for
-/// both distance and edit content. This is used to combine the two graphs built
-/// from the sub-cost-1 and sub-cost-2 Levenshtein matrices, giving the scorer
-/// access to a richer set of candidate alignments.
 fn merge_graphs(g1: EditGraph, g2: EditGraph) -> EditGraph {
+    let mut vertex_set: HashSet<Vertex> = g1.vertices.iter().copied().collect();
     let mut vertices = g1.vertices;
     for v in g2.vertices {
-        if !vertices.contains(&v) {
+        if vertex_set.insert(v) {
             vertices.push(v);
         }
     }
-    vertices.sort();
+    vertices.sort_unstable();
 
+    let mut edge_set: HashSet<Edge> = g1.edges.iter().copied().collect();
     let mut edges = g1.edges;
     for e in g2.edges {
-        if !edges.contains(&e) {
+        if edge_set.insert(e) {
             edges.push(e);
         }
     }
-    edges.sort();
+    edges.sort_unstable();
 
     let mut dist = g1.dist;
     for (k, v) in g2.dist {
@@ -272,12 +224,6 @@ fn merge_graphs(g1: EditGraph, g2: EditGraph) -> EditGraph {
     }
 }
 
-/// Combines two adjacent edits into a single edit spanning both their token ranges.
-///
-/// The resulting `EditKind` is determined by the combination of input kinds: for
-/// example, Del+Ins becomes Sub, Noop+Noop stays Noop, and anything involving a
-/// non-noop operation produces Sub or preserves the dominant operation type.
-/// `unchanged_words` is summed so callers can gate on `max_unchanged_words`.
 fn merge_edits(e1: &Edit, e2: &Edit) -> Edit {
     let join = |a: &str, b: &str| format!("{} {}", a, b);
     let (kind, start, end, orig, corr) = match (&e1.kind, &e2.kind) {
@@ -295,14 +241,7 @@ fn merge_edits(e1: &Edit, e2: &Edit) -> Edit {
             e2.orig.clone(),
             e1.corr.clone(),
         ),
-        (EditKind::Ins, EditKind::Sub) => (
-            EditKind::Sub,
-            e1.start,
-            e2.end,
-            e2.orig.clone(),
-            join(&e1.corr, &e2.corr),
-        ),
-        (EditKind::Ins, EditKind::Noop) => (
+        (EditKind::Ins, EditKind::Sub | EditKind::Noop) => (
             EditKind::Sub,
             e1.start,
             e2.end,
@@ -323,14 +262,7 @@ fn merge_edits(e1: &Edit, e2: &Edit) -> Edit {
             join(&e1.orig, &e2.orig),
             String::new(),
         ),
-        (EditKind::Del, EditKind::Sub) => (
-            EditKind::Sub,
-            e1.start,
-            e2.end,
-            join(&e1.orig, &e2.orig),
-            e2.corr.clone(),
-        ),
-        (EditKind::Del, EditKind::Noop) => (
+        (EditKind::Del, EditKind::Sub | EditKind::Noop) => (
             EditKind::Sub,
             e1.start,
             e2.end,
@@ -351,14 +283,7 @@ fn merge_edits(e1: &Edit, e2: &Edit) -> Edit {
             join(&e1.orig, &e2.orig),
             e1.corr.clone(),
         ),
-        (EditKind::Sub, EditKind::Sub) => (
-            EditKind::Sub,
-            e1.start,
-            e2.end,
-            join(&e1.orig, &e2.orig),
-            join(&e1.corr, &e2.corr),
-        ),
-        (EditKind::Sub, EditKind::Noop) => (
+        (EditKind::Sub, EditKind::Sub | EditKind::Noop) => (
             EditKind::Sub,
             e1.start,
             e2.end,
@@ -404,19 +329,11 @@ fn merge_edits(e1: &Edit, e2: &Edit) -> Edit {
     }
 }
 
-/// Extends the graph with transitive arcs that represent multi-token edits.
-///
-/// Uses a Floyd-Warshall-style triple loop: for every pair of adjacent edges
-/// (vi→vk) and (vk→vj), if their combined distance is shorter than the current
-/// vi→vj distance, a new arc is added by merging the two edits via `merge_edits`.
-/// An arc is only added when the merged edit's `unchanged_words` count stays within
-/// `max_unchanged_words`, which controls how wide a span the scorer considers.
-///
-/// After all arcs are added, transitive noop arcs (distance > 1.0) are removed
-/// because they span multiple unchanged tokens and do not represent real edits.
 fn transitive_arcs(mut graph: EditGraph, max_unchanged_words: usize) -> EditGraph {
     let v = graph.vertices.clone();
     let n = v.len();
+
+    let mut existing_edges: HashSet<Edge> = graph.edges.iter().copied().collect();
 
     for k in 0..n {
         let vk = v[k];
@@ -438,7 +355,9 @@ fn transitive_arcs(mut graph: EditGraph, max_unchanged_words: usize) -> EditGrap
                 if dik + dkj < cur {
                     let merged = merge_edits(&eik, &ekj);
                     if merged.unchanged_words <= max_unchanged_words {
-                        graph.edges.push((vi, vj));
+                        if existing_edges.insert((vi, vj)) {
+                            graph.edges.push((vi, vj));
+                        }
                         graph.dist.insert((vi, vj), dik + dkj);
                         graph.edits.insert((vi, vj), merged);
                     }
@@ -447,7 +366,8 @@ fn transitive_arcs(mut graph: EditGraph, max_unchanged_words: usize) -> EditGrap
         }
     }
 
-    let to_remove: Vec<Edge> = graph
+    // Identify transitive noop arcs to prune
+    let to_remove: HashSet<Edge> = graph
         .edges
         .iter()
         .filter(|&&e| {
@@ -457,11 +377,12 @@ fn transitive_arcs(mut graph: EditGraph, max_unchanged_words: usize) -> EditGrap
                 .map_or(false, |ed| ed.kind == EditKind::Noop)
                 && *graph.dist.get(&e).unwrap_or(&0.0) > 1.0
         })
-        .cloned()
+        .copied()
         .collect();
 
+    // Fast O(|E|) batch deletion
+    graph.edges.retain(|e| !to_remove.contains(e));
     for e in to_remove {
-        graph.edges.retain(|x| x != &e);
         graph.dist.insert(e, f64::INFINITY);
         graph.edits.remove(&e);
     }
@@ -469,10 +390,6 @@ fn transitive_arcs(mut graph: EditGraph, max_unchanged_words: usize) -> EditGrap
     graph
 }
 
-/// Returns true if a system edit matches a gold edit.
-///
-/// A match requires identical span (start, end), identical original text, and
-/// the system's correction appearing in the gold's accepted corrections list.
 fn edit_matches_gold(edit: &Edit, gold: &GoldEdit) -> bool {
     edit.start == gold.start as usize
         && edit.end == gold.end as usize
@@ -480,19 +397,6 @@ fn edit_matches_gold(edit: &Edit, gold: &GoldEdit) -> bool {
         && gold.corrections.contains(&edit.corr)
 }
 
-/// Assigns weights to graph edges based on how well they match the gold edits.
-///
-/// Edges whose edit matches a gold edit receive a large negative weight (-|E|),
-/// making them strongly preferred by Bellman-Ford. Non-matching, non-noop edges
-/// receive a small positive epsilon to break ties against noop paths. Noop edges
-/// are left unchanged.
-///
-/// Insertion edges (where start == end, i.e. zero-width spans) require special
-/// handling: multiple insertions can occur at the same position, so a bidirectional
-/// pointer scheme is used to greedily match them left-to-right and right-to-left
-/// alternately, ensuring each gold edit is claimed by at most one system edit.
-/// Deletion and substitution edges are simpler - any edge matching any gold edit
-/// at the same span receives the reward, independently of order.
 fn set_weights(graph: &EditGraph, gold_edits: &[GoldEdit]) -> HashMap<Edge, f64> {
     const EPSILON: f64 = 0.001;
     let num_edges = graph.edges.len() as f64;
@@ -506,7 +410,7 @@ fn set_weights(graph: &EditGraph, gold_edits: &[GoldEdit]) -> HashMap<Edge, f64>
         }
     }
     for edges in m.values_mut() {
-        edges.sort();
+        edges.sort_unstable();
     }
 
     let mut g: HashMap<(usize, usize), Vec<&GoldEdit>> = HashMap::new();
@@ -530,7 +434,11 @@ fn set_weights(graph: &EditGraph, gold_edits: &[GoldEdit]) -> HashMap<Edge, f64>
             let mut rptr = span_edges.len() - 1;
             let mut cur = lptr;
             let mut g_lptr = 0usize;
-            let mut g_rptr = gold_list.len().saturating_sub(1);
+            let mut g_rptr = if gold_list.is_empty() {
+                0
+            } else {
+                gold_list.len() - 1
+            };
 
             while lptr <= rptr {
                 let edge = span_edges[cur];
@@ -539,33 +447,29 @@ fn set_weights(graph: &EditGraph, gold_edits: &[GoldEdit]) -> HashMap<Edge, f64>
                     None => break,
                 };
 
-                // Alternate search direction based on which pointer is active.
-                let cur_gold_range: Vec<usize> = if cur == lptr {
-                    (g_lptr..=g_rptr.min(gold_list.len().saturating_sub(1))).collect()
+                let cur_gold_range: Vec<usize> = if gold_list.is_empty() {
+                    Vec::new()
+                } else if cur == lptr {
+                    (g_lptr..=g_rptr.min(gold_list.len() - 1)).collect()
                 } else {
-                    (g_lptr..=g_rptr.min(gold_list.len().saturating_sub(1)))
-                        .rev()
-                        .collect()
+                    (g_lptr..=g_rptr.min(gold_list.len() - 1)).rev().collect()
                 };
 
                 let mut has_match = false;
-                let mut matched_i = 0;
                 for &i in &cur_gold_range {
                     if i < gold_list.len() && edit_matches_gold(this_edit, gold_list[i]) {
                         has_match = true;
-                        matched_i = i;
                         ret_dist.insert(edge, -num_edges);
                         if cur == lptr {
                             g_lptr = i + 1;
                         } else if i > 0 {
                             g_rptr = i - 1;
                         } else {
-                            break;
+                            g_rptr = 0;
                         }
                         break;
                     }
                 }
-                let _ = matched_i;
 
                 if !has_match && this_edit.kind != EditKind::Noop {
                     *ret_dist.entry(edge).or_insert(1.0) += EPSILON;
@@ -639,14 +543,6 @@ fn set_weights(graph: &EditGraph, gold_edits: &[GoldEdit]) -> HashMap<Edge, f64>
     ret_dist
 }
 
-/// Finds the edit sequence through the graph that matches the most gold edits,
-/// using Bellman-Ford shortest-path on the weighted graph.
-///
-/// Because gold-matching edges have negative weight and spurious edges carry a
-/// small positive epsilon, the minimum-cost path is also the maximally
-/// gold-matching path. The path is recovered by backtracking from the last
-/// (bottom-right) vertex. Noop edges are excluded from the returned sequence
-/// since they represent unchanged tokens, not proposed corrections.
 fn best_edit_seq_bf(graph: &EditGraph, dist: &HashMap<Edge, f64>) -> Vec<Edit> {
     let mut this_dist: HashMap<Vertex, f64> = HashMap::new();
     let mut path: HashMap<Vertex, Vertex> = HashMap::new();
@@ -656,14 +552,24 @@ fn best_edit_seq_bf(graph: &EditGraph, dist: &HashMap<Edge, f64>) -> Vec<Edit> {
     }
     this_dist.insert((0, 0), 0.0);
 
+    // Bellman-Ford with early stopping
     for _ in 0..graph.vertices.len().saturating_sub(1) {
+        let mut updated = false;
         for &(vi, vw) in &graph.edges {
-            let d_edge = *dist.get(&(vi, vw)).unwrap_or(&f64::INFINITY);
             let d_vi = *this_dist.get(&vi).unwrap_or(&f64::INFINITY);
-            if d_vi + d_edge < *this_dist.get(&vw).unwrap_or(&f64::INFINITY) {
+            if d_vi.is_infinite() {
+                continue;
+            }
+            let d_edge = *dist.get(&(vi, vw)).unwrap_or(&f64::INFINITY);
+            let d_vw = *this_dist.get(&vw).unwrap_or(&f64::INFINITY);
+            if d_vi + d_edge < d_vw {
                 this_dist.insert(vw, d_vi + d_edge);
                 path.insert(vw, vi);
+                updated = true;
             }
+        }
+        if !updated {
+            break;
         }
     }
 
@@ -687,13 +593,6 @@ fn best_edit_seq_bf(graph: &EditGraph, dist: &HashMap<Edge, f64>) -> Vec<Edit> {
     edit_seq
 }
 
-/// Returns the subset of `edit_seq` that matches entries in `gold_edits`.
-///
-/// Iterates the edit sequence in source order (the sequence comes out of
-/// Bellman-Ford in reverse, so we iterate reversed) and for each edit performs
-/// a linear scan through the gold list starting from where the previous match
-/// left off. This preserves ordering: a gold edit can only be claimed once, and
-/// only by the first system edit that matches it in left-to-right order.
 fn match_seq(edit_seq: &[Edit], gold_edits: &[GoldEdit]) -> Vec<Edit> {
     let mut matched: Vec<Edit> = Vec::new();
     let gold_seq: Vec<&GoldEdit> = gold_edits.iter().collect();
@@ -716,104 +615,47 @@ fn match_seq(edit_seq: &[Edit], gold_edits: &[GoldEdit]) -> Vec<Edit> {
     matched
 }
 
-/// Returns true if two strings are equal when whitespace and casing are ignored.
 fn equals_ignore_whitespace_casing(a: &str, b: &str) -> bool {
     a.replace(' ', "").to_lowercase() == b.replace(' ', "").to_lowercase()
 }
 
-/// Scores a single hypothesis sentence against its gold annotations.
-///
-/// Builds two Levenshtein graphs (sub-cost 1 and 2), merges them, adds
-/// transitive arcs, then for each annotator runs `set_weights` and
-/// `best_edit_seq_bf` to find the best-matching edit sequence. Returns the
-/// (correct, proposed, gold) triple for the annotator that maximises F_beta
-/// for this sentence. Annotator selection is local to the sentence rather than
-/// cumulative across the corpus, which allows sentences to be scored independently.
-fn score_single(
-    candidate: &str,
-    source: &str,
-    golds_set: &HashMap<u32, Vec<GoldEdit>>,
-    max_unchanged_words: usize,
-    beta: f64,
-    ignore_whitespace_casing: bool,
-) -> (f64, f64, f64) {
-    let candidate_tok: Vec<String> = candidate.split_whitespace().map(String::from).collect();
-    let source_tok: Vec<String> = source.split_whitespace().map(String::from).collect();
-
-    let (mat1, bp1) = levenshtein_matrix(&source_tok, &candidate_tok, 1, 1, 1);
-    let (mat2, bp2) = levenshtein_matrix(&source_tok, &candidate_tok, 1, 1, 2);
-
-    let g1 = build_edit_graph(&mat1, &bp1);
-    let g2 = build_edit_graph(&mat2, &bp2);
-    let mut graph = merge_graphs(g1, g2);
-    graph = transitive_arcs(graph, max_unchanged_words);
-
-    let sqbeta = beta * beta;
-    let mut best_f1 = -1.0f64;
-    let mut best_sc = -1.0f64;
-    let mut best_sp = f64::INFINITY;
-    let mut best_sg = f64::INFINITY;
-    let mut argmax_correct = 0.0f64;
-    let mut argmax_proposed = 0.0f64;
-    let mut argmax_gold = 0.0f64;
-
-    for gold_list in golds_set.values() {
-        let local_dist = set_weights(&graph, gold_list);
-        let mut edit_seq = best_edit_seq_bf(&graph, &local_dist);
-
-        if ignore_whitespace_casing {
-            edit_seq.retain(|e| !equals_ignore_whitespace_casing(&e.orig, &e.corr));
-        }
-
-        let correct = match_seq(&edit_seq, gold_list);
-
-        let sc = correct.len() as f64;
-        let sp = edit_seq.len() as f64;
-        let sg = gold_list.len() as f64;
-
-        let f1 = {
-            let denom = sqbeta * sg + sp;
-            if denom == 0.0 {
-                if sc == 0.0 {
-                    1.0
-                } else {
-                    0.0
-                }
-            } else {
-                (1.0 + sqbeta) * sc / denom
-            }
-        };
-
-        let is_better = f1 > best_f1
-            || (f1 == best_f1 && sc > best_sc)
-            || (f1 == best_f1 && sc == best_sc && sp + sqbeta * sg < best_sp + sqbeta * best_sg);
-
-        if is_better {
-            best_f1 = f1;
-            best_sc = sc;
-            best_sp = sp;
-            best_sg = sg;
-            argmax_correct = sc;
-            argmax_proposed = sp;
-            argmax_gold = sg;
-        }
+#[inline]
+fn comp_p(a: f64, b: f64) -> f64 {
+    if b == 0.0 {
+        1.0
+    } else {
+        a / b
     }
-
-    (argmax_correct, argmax_proposed, argmax_gold)
 }
 
-/// Scores a batch of hypothesis sentences against gold M2 annotations and returns
-/// corpus-level precision, recall, and F_beta.
+#[inline]
+fn comp_r(c: f64, g: f64) -> f64 {
+    if g == 0.0 {
+        1.0
+    } else {
+        c / g
+    }
+}
+
+#[inline]
+fn comp_f1(c: f64, e: f64, g: f64, beta: f64) -> f64 {
+    let sqbeta = beta * beta;
+    let denom = sqbeta * g + e;
+    if denom == 0.0 {
+        if c == 0.0 {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        (1.0 + sqbeta) * c / denom
+    }
+}
+
+/// Scores a batch of hypothesis sentences against gold M2 annotations.
 ///
-/// `candidates` and `sources` are parallel lists of tokenised sentences.
-/// `gold_edits_raw` is a list of per-sentence annotation maps: each map has
-/// annotator IDs as keys and lists of (start, end, original, corrections) tuples
-/// as values, matching the structure produced by the Python M2 parser.
-///
-/// Each sentence is scored independently via `score_single`. Correct, proposed,
-/// and gold edit counts are accumulated across the corpus and used to compute
-/// the final metrics. Precision defaults to 1.0 when no edits are proposed;
-/// recall defaults to 1.0 when the gold set is empty.
+/// Annotator selection is evaluated cumulatively per sentence matching the
+/// official Dahlmeier & Ng Python implementation.
 #[pyfunction]
 #[pyo3(signature = (
     candidates,
@@ -834,7 +676,7 @@ fn batch_multi_pre_rec_f1(
     assert_eq!(candidates.len(), sources.len());
     assert_eq!(candidates.len(), gold_edits_raw.len());
 
-    let gold_edits: Vec<HashMap<u32, Vec<GoldEdit>>> = gold_edits_raw
+    let gold_edits: Vec<BTreeMap<u32, Vec<GoldEdit>>> = gold_edits_raw
         .into_iter()
         .map(|ann_map| {
             ann_map
@@ -858,35 +700,79 @@ fn batch_multi_pre_rec_f1(
     let mut stat_correct = 0.0f64;
     let mut stat_proposed = 0.0f64;
     let mut stat_gold = 0.0f64;
+    let sqbeta = beta * beta;
 
     for ((candidate, source), golds_set) in
         candidates.iter().zip(sources.iter()).zip(gold_edits.iter())
     {
-        let (c, p, g) = score_single(
-            candidate,
-            source,
-            golds_set,
-            max_unchanged_words,
-            beta,
-            ignore_whitespace_casing,
-        );
-        stat_correct += c;
-        stat_proposed += p;
-        stat_gold += g;
+        let candidate_tok: Vec<String> = candidate.split_whitespace().map(String::from).collect();
+        let source_tok: Vec<String> = source.split_whitespace().map(String::from).collect();
+
+        let (mat1, bp1) = levenshtein_matrix(&source_tok, &candidate_tok, 1, 1, 1);
+        let (mat2, bp2) = levenshtein_matrix(&source_tok, &candidate_tok, 1, 1, 2);
+
+        let g1 = build_edit_graph(&mat1, &bp1);
+        let g2 = build_edit_graph(&mat2, &bp2);
+        let mut graph = merge_graphs(g1, g2);
+        graph = transitive_arcs(graph, max_unchanged_words);
+
+        let mut f1_max = -1.0f64;
+        let mut max_stat_correct = -1.0f64;
+        let mut min_stat_proposed = f64::INFINITY;
+        let mut min_stat_gold = f64::INFINITY;
+
+        let mut argmax_correct = 0.0f64;
+        let mut argmax_proposed = 0.0f64;
+        let mut argmax_gold = 0.0f64;
+
+        // BTreeMap guarantees deterministic annotator iteration
+        for gold_list in golds_set.values() {
+            let local_dist = set_weights(&graph, gold_list);
+            let mut edit_seq = best_edit_seq_bf(&graph, &local_dist);
+
+            if ignore_whitespace_casing {
+                edit_seq.retain(|e| !equals_ignore_whitespace_casing(&e.orig, &e.corr));
+            }
+
+            let correct = match_seq(&edit_seq, gold_list);
+
+            let stat_correct_local = stat_correct + correct.len() as f64;
+            let stat_proposed_local = stat_proposed + edit_seq.len() as f64;
+            let stat_gold_local = stat_gold + gold_list.len() as f64;
+
+            let f1_local = comp_f1(
+                stat_correct_local,
+                stat_proposed_local,
+                stat_gold_local,
+                beta,
+            );
+
+            let is_better = f1_max < f1_local
+                || (f1_max == f1_local && max_stat_correct < stat_correct_local)
+                || (f1_max == f1_local
+                    && max_stat_correct == stat_correct_local
+                    && min_stat_proposed + sqbeta * min_stat_gold
+                        > stat_proposed_local + sqbeta * stat_gold_local);
+
+            if is_better {
+                f1_max = f1_local;
+                max_stat_correct = stat_correct_local;
+                min_stat_proposed = stat_proposed_local;
+                min_stat_gold = stat_gold_local;
+                argmax_correct = correct.len() as f64;
+                argmax_proposed = edit_seq.len() as f64;
+                argmax_gold = gold_list.len() as f64;
+            }
+        }
+
+        stat_correct += argmax_correct;
+        stat_proposed += argmax_proposed;
+        stat_gold += argmax_gold;
     }
 
-    let p = if stat_proposed == 0.0 {
-        1.0
-    } else {
-        stat_correct / stat_proposed
-    };
-    let r = if stat_gold == 0.0 {
-        1.0
-    } else {
-        stat_correct / stat_gold
-    };
+    let p = comp_p(stat_correct, stat_proposed);
+    let r = comp_r(stat_correct, stat_gold);
     let f1 = {
-        let sqbeta = beta * beta;
         let denom = sqbeta * p + r;
         if denom == 0.0 {
             0.0
